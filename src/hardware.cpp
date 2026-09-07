@@ -40,6 +40,10 @@ LedControlPtr createHardware(const std::string& model, PortIo& io) {
     else if (model == "acer-h341") control = std::make_shared<LedAcerH341>(io);
     else if (model == "acer-altos-m2") control = std::make_shared<LedAcerAltosM2>(io);
     else throw std::invalid_argument("Unsupported hardware model");
-    if (!control->Init()) throw std::runtime_error("LPC/SCH5127 identity or register base validation failed");
+    if (!control->Init()) {
+        const auto sch = std::dynamic_pointer_cast<LedControlSCH5127Base>(control);
+        throw std::runtime_error(sch && !sch->ValidationError().empty()
+            ? sch->ValidationError() : "LPC/SCH5127 validation failed");
+    }
     return control;
 }

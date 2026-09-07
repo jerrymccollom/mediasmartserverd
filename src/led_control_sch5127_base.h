@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <sstream>
 
 class LedControlSCH5127Base : public LedControlBase {
 public:
@@ -47,7 +48,11 @@ public:
             try { io_.permission(start, i - start, false); } catch (...) {}
         }
     }
-    bool Init() override { return initPciLpc_() && initSch5127_(); }
+    bool Init() override {
+        validation_error_.clear();
+        return initPciLpc_() && initSch5127_();
+    }
+    const std::string& ValidationError() const { return validation_error_; }
     void DisableWatchdog() override {
         // Explicit opt-in only; preserve the watchdog during ordinary startup.
         IoGrant grant(io_, io_sch5127_regs_ + REG_WDT_TIME_OUT, 4);
@@ -99,19 +104,32 @@ protected:
 	
 
     virtual bool chkPciDeviceVendorId_(unsigned did_vid) const = 0;
+    virtual bool chkSchDeviceId_(unsigned device_id) const { return device_id == 0x86; }
     bool initPciLpc_() {
         IoGrant address(io_, 0xcf8, 4), data(io_, 0xcfc, 4);
         outl(0x8000f800, 0xcf8);
-        if (!chkPciDeviceVendorId_(inl(0xcfc))) return false;
+        const uint32_t identity = inl(0xcfc);
+        if (!chkPciDeviceVendorId_(identity)) {
+            std::ostringstream message;
+            message << "LPC identity validation failed: read 0x" << std::hex << identity;
+            validation_error_ = message.str();
+            return false;
+        }
         outl(0x8000f848, 0xcf8);
         const uint32_t base = inl(0xcfc);
-        if ((base & 0xffff007fU) != 1 || (base & ~1U) == 0) return false;
+        if ((base & 0xffff007fU) != 1 || (base & ~1U) == 0) {
+            std::ostringstream message;
+            message << "LPC GPIO base validation failed: read 0x" << std::hex << base;
+            validation_error_ = message.str();
+            return false;
+        }
         io_lpc_gpiobase_ = base & ~1U;
         return true;
     }
     bool initSch5127_() {
         // Datasheet DS00002081A: global ID 0x86, LDN 0x0a runtime block,
         // 128-byte alignment within the 12-bit address space.
+        std::ostringstream observations;
         for (unsigned address : {0x2eU, 0x4eU}) {
             IoGrant grant(io_, address, 2);
             struct ConfigExit {
@@ -120,17 +138,26 @@ protected:
             } exit{io_, address};
             outb(0x55, address);
             outb(0x20, address);
-            if (inb(address + 1) != 0x86) continue;
+            const unsigned identity = inb(address + 1);
+            observations << (address == 0x2e ? "0x2e" : ", 0x4e")
+                         << ": ID 0x" << std::hex << identity;
+            if (!chkSchDeviceId_(identity)) continue;
             outb(0x07, address); outb(0x0a, address + 1);
             outb(0x60, address); const unsigned high = inb(address + 1);
             outb(0x61, address); const unsigned low = inb(address + 1);
             const unsigned base = (high << 8) | low;
-            if (base < 0x100 || base > 0xf00 || (base & 0x7f)) return false;
+            observations << ", base 0x" << base;
+            // A chip can still answer global configuration reads through one
+            // standard port while its usable configuration interface is the
+            // other one.  Do not let a stale/invalid base from the first
+            // address prevent probing the second address.
+            if (base < 0x100 || base > 0xf00 || (base & 0x7f)) continue;
             if (base < io_lpc_gpiobase_ + 0x40 && io_lpc_gpiobase_ < base + 0x80)
-                return false;
+                continue;
             io_sch5127_regs_ = base;
             return true;
         }
+        validation_error_ = "SCH5127 identity/runtime base validation failed (" + observations.str() + ")";
         return false;
     }
     static void setBit32_(int bit, uint32_t& first, uint32_t& second) {
@@ -173,6 +200,7 @@ protected:
     std::bitset<65536> permissions_;
     unsigned io_lpc_gpiobase_ = 0;
     unsigned io_sch5127_regs_ = 0;
+    std::string validation_error_;
     int ioperm(unsigned port, unsigned count, int enable) {
         if (port > 65535 || count > 65536 - port) throw std::out_of_range("I/O permission");
         const int result = io_.permission(port, count, enable);

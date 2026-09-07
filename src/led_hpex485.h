@@ -141,6 +141,12 @@ protected:
 		// ISA bridge [0601]: Intel Corporation 82801IR (ICH9R) LPC Interface Controller [8086:2916] (rev 02)
 		return ( 0x29168086 == did_vid );
 	}
+
+	// HP's EX48x firmware exposes 0xc1 at the Super I/O device-ID index.
+	// Retail SCH5127 parts expose the documented 0x86 value.
+	bool chkSchDeviceId_(unsigned device_id) const override {
+		return device_id == 0xc1 || device_id == 0x86;
+	}
 	
 	/////////////////////////////////////////////////////////////////////////
 	/// blue LED mappings

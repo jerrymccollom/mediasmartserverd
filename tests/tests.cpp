@@ -59,6 +59,8 @@ struct FakeIo : PortIo {
     uint32_t pci_address = 0, lpc = 0x29168086, gpio_base = 0x501;
     unsigned sch_base = 0x600, sio = 0x2e;
     uint8_t id = 0x86;
+    std::map<unsigned, uint8_t> sio_ids;
+    std::map<unsigned, unsigned> sio_bases;
     std::map<unsigned, uint8_t> index;
     int grants = 0, fail_grant = -1;
     size_t reads = 0;
@@ -71,11 +73,15 @@ struct FakeIo : PortIo {
     uint8_t read8(unsigned port) override {
         check(port, 1); ++reads;
         if (port == 0x2f || port == 0x4f) {
-            if (port != sio + 1) return 0xff;
+            const unsigned config_port = port - 1;
+            if (!sio_ids.empty() && !sio_ids.count(config_port)) return 0xff;
+            if (sio_ids.empty() && port != sio + 1) return 0xff;
+            const uint8_t port_id = sio_ids.empty() ? id : sio_ids.at(config_port);
+            const unsigned port_base = sio_bases.count(config_port) ? sio_bases.at(config_port) : sch_base;
             switch (index[port - 1]) {
-            case 0x20: return id;
-            case 0x60: return sch_base >> 8;
-            case 0x61: return sch_base & 0xff;
+            case 0x20: return port_id;
+            case 0x60: return port_base >> 8;
+            case 0x61: return port_base & 0xff;
             default: return 0;
             }
         }
@@ -154,6 +160,20 @@ void testRejectedHardware() {
     FakeIo io; io.sio = 0x4e;
     { auto hardware = createHardware("hp-ex48x", io); }
     CHECK(io.allowed.none());
+    // Some firmware exposes the global ID at both standard ports, but only
+    // the configured port has a usable logical-device view.  The first
+    // invalid view must not suppress the fallback probe.
+    FakeIo redirected;
+    redirected.sio_ids = {{0x2e, 0x86}, {0x4e, 0x86}};
+    redirected.sio_bases = {{0x2e, 0}, {0x4e, 0xa00}};
+    { auto hardware = createHardware("hp-ex48x", redirected); }
+    CHECK(redirected.allowed.none());
+    FakeIo hp_oem_id; hp_oem_id.id = 0xc1;
+    { auto hardware = createHardware("hp-ex48x", hp_oem_id); }
+    CHECK(hp_oem_id.allowed.none());
+    FakeIo wrong_model_id; wrong_model_id.lpc = 0x27b88086; wrong_model_id.id = 0xc1;
+    throws([&] { createHardware("acer-h340", wrong_model_id); });
+    CHECK(wrong_model_id.allowed.none());
     CHECK(detectModel("HP", "MediaSmart Server") == "hp-ex48x");
     CHECK(detectModel("Acer", "Aspire easyStore H342") == "acer-h341");
     CHECK(detectModel("LENOVO", "IdeaCentre D400 10023") == "acer-h340");

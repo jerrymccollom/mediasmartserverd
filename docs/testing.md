@@ -124,7 +124,8 @@ configured helper is a trusted fixed executable, not an arbitrary job runner.
 ## Hardware references
 
 - [SCH5127 datasheet DS00002081A](https://ww1.microchip.com/downloads/en/DeviceDoc/00002081A.pdf):
-  global configuration ID `0x86` (register `0x20`), runtime block alignment and
+  global configuration ID `0x86` (register `0x20`; HP EX48x firmware reports
+  its OEM value `0xc1`), runtime block alignment and
   address bounds, and byte-wide GP1–GP6 registers (offsets `0x4b`–`0x50`).
   The H341's historical masks above bit 7 are translated to the corresponding
   adjacent byte and bit, preserving their physical target without wide writes.

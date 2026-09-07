@@ -27,7 +27,8 @@ helpers explicitly revoke inherited port permissions, close other descriptors,
 restore signal delivery, and execute with a small fixed environment and
 `no_new_privs`. The root-owned instance lock is held until process exit.
 
-Hardware initialization validates the LPC identity, SCH5127 device ID (`0x86`),
+Hardware initialization validates the LPC identity, the SCH5127 device ID
+(`0x86`, plus the HP EX48x OEM value `0xc1` on that model only),
 and register bases before configuring GPIOs for LED control. The watchdog is
 preserved by default. `--disable-watchdog` explicitly requests the historical
 behavior of clearing the four watchdog registers; use it only when that is the
