@@ -1,4 +1,4 @@
-# mediasmartserverd usage guide
+# Installing and using mediasmartserverd
 
 `mediasmartserverd` controls the four drive-bay LEDs and system/status LED on
 supported HP MediaSmart and Acer/Lenovo servers. It can indicate disk presence,
@@ -7,24 +7,6 @@ show disk activity, report available Ubuntu updates, or run built-in light shows
 This guide describes the source in this repository, including options omitted
 from `--help`. Examples that start the program access real hardware. Run only
 one LED-controlling instance at a time.
-
-## How this machine is running it
-
-Read-only inspection on September 7, 2026 found:
-
-| Item | Observed value |
-| --- | --- |
-| Hardware DMI vendor/product | `HP` / `MediaSmart Server` |
-| Running command | `/opt/mediasmartserverd -D` |
-| Process user/group | `root` / `nogroup` |
-| Startup configuration | `/etc/rc.local`, line 7 |
-| Startup line | `test -x /opt/mediasmartserverd && /opt/mediasmartserverd -D` |
-| `mediasmartserver.service` | Not installed |
-
-Those arguments select background disk-presence monitoring, without activity
-or update monitoring and without an explicit brightness setting. The installed
-`/opt` binary was not compared with the repository build, so the option reference
-below is specifically for this source version.
 
 ## Hardware and system requirements
 
@@ -37,7 +19,7 @@ parameter. It needs a system that permits this direct hardware access.
 Start it as root, normally through `sudo` or the startup service. Although the
 source contains a function intended to drop privileges to `nobody`, its
 `setgid(...) && setuid(...)` expression skips `setuid` when `setgid` succeeds.
-Do not assume the daemon becomes unprivileged; the observed process remains root.
+Do not assume the daemon becomes unprivileged after startup.
 
 Hardware initialization disables the SCH5127 watchdog and configures GPIOs for
 LED control. This is hardware-specific software, not a general-purpose LED tool
@@ -57,7 +39,11 @@ An unrecognized Acer or Lenovo product does not take the HP fallback. Actual
 chipset checks must also succeed. The original README reports testing on an HP
 ex485; code paths for other models are not a guarantee of compatibility.
 
-## Building
+## Building from source
+
+Download or clone this repository, then open a terminal in its top-level
+directory (the directory containing `Makefile`). The commands below assume
+you are running them from that directory.
 
 The build needs `g++`, `make`, C++ headers/libraries, and libudev development
 headers. On a Debian/Ubuntu installation with these packages available:
@@ -81,6 +67,86 @@ it is not a reliable identifier of the source revision.
 The `.deb` files in `bin/` and Debian packaging metadata are historical. They
 refer to older dependencies such as `libudev0` and `upstart-job`; use care when
 treating them as installation instructions for a different distribution.
+
+## Installing and starting with systemd
+
+The repository includes `lib/systemd/system/mediasmartserver.service`, which runs:
+
+```text
+/usr/sbin/mediasmartserverd --activity --update-monitor
+```
+
+It stays in the foreground under systemd, starts as root, and uses
+`Restart=always`. Do not add `-D` to this unit. An explicit `systemctl stop`
+stops it; simply killing its process can cause it to restart.
+
+On a Linux installation using systemd, build the binary as described above.
+If upgrading or replacing an existing installation, stop its service or process
+first. Disable any competing startup entry (for example, an older Upstart job or
+an entry in `/etc/rc.local`) so only one instance starts at boot.
+
+Install the binary and bundled service, then enable monitoring now and at boot:
+
+```bash
+sudo install -m 0755 mediasmartserverd /usr/sbin/mediasmartserverd
+sudo install -m 0644 lib/systemd/system/mediasmartserver.service /etc/systemd/system/mediasmartserver.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mediasmartserver.service
+```
+
+The bundled service enables update notifications, which require
+`/usr/lib/update-notifier/apt-check` (historically supplied by
+`update-notifier-common` on Ubuntu). If that helper is unavailable or you only
+want disk monitoring, use the override below to omit `--update-monitor`.
+
+Check service status and logs, or manage it with:
+
+```bash
+systemctl status mediasmartserver.service
+journalctl -u mediasmartserver.service -b
+sudo systemctl stop mediasmartserver.service
+sudo systemctl start mediasmartserver.service
+sudo systemctl restart mediasmartserver.service
+```
+
+To customize arguments, use `sudo systemctl edit mediasmartserver.service` and
+provide an override such as:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/mediasmartserverd --activity --brightness=4
+```
+
+This example omits update monitoring. Then run `sudo systemctl daemon-reload`
+and `sudo systemctl restart mediasmartserver.service`. For a foreground light
+show, stop the service first and start it again afterward. Avoid putting
+`--xmas` in the supplied `Restart=always` unit: it exits immediately and would
+be repeatedly restarted.
+
+An older Upstart job is also included at `etc/init/mediasmartserver.conf`, with
+the same activity/update options and `respawn`. It is an alternative startup
+mechanism, not an additional one to enable alongside systemd or `rc.local`.
+
+## Running without systemd
+
+After building, test normal monitoring in the foreground:
+
+```bash
+sudo ./mediasmartserverd --activity --brightness=4 --verbose
+```
+
+Stop it with Ctrl+C. To install the executable and launch it in the background:
+
+```bash
+sudo install -m 0755 mediasmartserverd /usr/sbin/mediasmartserverd
+sudo /usr/sbin/mediasmartserverd -D --activity --brightness=4
+```
+
+This manual launch does not configure startup at boot. Use your distribution's
+service manager for persistent startup, with the installed executable path and
+your chosen options. Use `-D` only when the startup mechanism expects the program
+to detach; a service manager supervising a foreground process should omit it.
 
 ## Command-line options
 
@@ -233,87 +299,34 @@ PID file, or reload option. Options apply to the process being launched; a new
 invocation does not send commands to the running daemon. Separate instances
 can overwrite each other's LED state and interfere with register updates.
 
-For this machine's current `/opt` and `rc.local` setup:
+If installed with systemd, stop the service before running a foreground mode,
+then start it again afterward:
 
 ```bash
-# Inspect the running PID and command first.
-ps -C mediasmartserverd -o pid,user,group,args
-
-# Replace 1234 with the PID you just inspected.
-sudo kill -TERM 1234
-
-# Confirm it has exited before launching a foreground show.
-ps -C mediasmartserverd -o pid,user,group,args
-sudo ./mediasmartserverd --light-show=4 --brightness=4
-
-# After Ctrl+C, restore the original background monitoring mode.
-sudo /opt/mediasmartserverd -D
+sudo systemctl stop mediasmartserver.service
+sudo /usr/sbin/mediasmartserverd --light-show=4 --brightness=4
+# After stopping the show with Ctrl+C:
+sudo systemctl start mediasmartserver.service
 ```
 
-The final command restores the original arguments, not the previous brightness.
-Add `--brightness=N` to choose a known level, using an installed binary that
-supports this option. Editing `rc.local` affects future starts, not the running
-process.
+For a manually launched instance, inspect the process and stop it by PID:
+
+```bash
+ps -C mediasmartserverd -o pid,user,group,args
+# Replace 1234 with the PID you just inspected.
+sudo kill -TERM 1234
+ps -C mediasmartserverd -o pid,user,group,args
+```
+
+Wait for the process to exit before launching another instance. If it is managed
+by another startup mechanism, stop it through that manager to prevent automatic
+restarts. After a show, restart your normal monitoring command with an explicit
+`--brightness=N` to restore a known brightness.
 
 In normal monitoring, SIGINT/SIGTERM interrupts the wait and the shutdown path
 clears the tracked bay LEDs and stops the update monitor. The old blinking
 system LED behavior is not restored. Background mode redirects standard output
 and error through `daemon(0, 0)`; use foreground execution for diagnostics.
-
-## Using the bundled systemd service
-
-The repository includes `lib/systemd/system/mediasmartserver.service`, which runs:
-
-```text
-/usr/sbin/mediasmartserverd --activity --update-monitor
-```
-
-It stays in the foreground under systemd, starts as root, and uses
-`Restart=always`. Do not add `-D` to this unit. An explicit `systemctl stop`
-stops it; simply killing its process can cause it to restart.
-
-For a fresh manual installation, after building and removing/disabling any
-competing startup entry and stopping its running instance:
-
-```bash
-sudo install -m 0755 mediasmartserverd /usr/sbin/mediasmartserverd
-sudo install -m 0644 lib/systemd/system/mediasmartserver.service /etc/systemd/system/mediasmartserver.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now mediasmartserver.service
-```
-
-On this machine, migrating would specifically require removing/commenting the
-`/etc/rc.local` startup line as well as stopping the existing `/opt` process.
-The commands above are instructions; no migration was performed for this guide.
-
-Once installed:
-
-```bash
-systemctl status mediasmartserver.service
-journalctl -u mediasmartserver.service -b
-sudo systemctl stop mediasmartserver.service
-sudo systemctl start mediasmartserver.service
-sudo systemctl restart mediasmartserver.service
-```
-
-To customize arguments, use `sudo systemctl edit mediasmartserver.service` and
-provide an override such as:
-
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/sbin/mediasmartserverd --activity --brightness=4
-```
-
-This example omits update monitoring. Then run `sudo systemctl daemon-reload`
-and `sudo systemctl restart mediasmartserver.service`. For a foreground light
-show, stop the service first and start it again afterward. Avoid putting
-`--xmas` in the supplied `Restart=always` unit: it exits immediately and would
-be repeatedly restarted.
-
-An older Upstart job is also included at `etc/init/mediasmartserver.conf`, with
-the same activity/update options and `respawn`. It is an alternative startup
-mechanism, not an additional one to enable alongside systemd or `rc.local`.
 
 ## Troubleshooting and implementation references
 
