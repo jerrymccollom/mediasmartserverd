@@ -50,6 +50,8 @@
 #include "led_acerh341.h"
 #include "led_hpex485.h"
 #include "update_monitor.h"
+#include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -108,8 +110,9 @@ const char *GetUdevDeviceAttribute(const char *subsystem, const char *sysname, c
 
 	device = udev_device_new_from_subsystem_sysname(udev, subsystem, sysname);
 	value = udev_device_get_sysattr_value(device, sysattr);
-	value.erase(value.begin(), std::find_if(value.begin(), value.end(), std::not1(std::ptr_fun<int, int>(std::isspace))));
-	value.erase(std::find_if(value.rbegin(), value.rend(), std::not1(std::ptr_fun<int, int>(std::isspace))).base(), value.end());
+	const auto isNotSpace = [](unsigned char ch) { return !std::isspace(ch); };
+	value.erase(value.begin(), std::find_if(value.begin(), value.end(), isNotSpace));
+	value.erase(std::find_if(value.rbegin(), value.rend(), isNotSpace).base(), value.end());
 	//free
 	udev_device_unref(device);
 	udev_unref(udev);

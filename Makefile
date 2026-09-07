@@ -4,6 +4,7 @@ SHELL = /bin/bash
 CC = gcc
 CXX = g++
 FLAGS = -Wall -O2
+#FLAGS = -Wall -g
 CFLAGS = $(FLAGS)
 CXXFLAGS = $(CFLAGS)
 LDFLAGS = -ludev -ldl -lpthread
