@@ -4,8 +4,7 @@
 supported HP MediaSmart and Acer/Lenovo servers. It can indicate disk presence,
 show disk activity, report available Ubuntu updates, or run built-in light shows.
 
-This guide describes the source in this repository, including options omitted
-from `--help`. Examples that start the program access real hardware. Run only
+This guide describes the source in this repository. Examples that start the program access real hardware. Run only
 one LED-controlling instance at a time.
 
 ## Hardware and system requirements
@@ -16,13 +15,23 @@ userspace; this repository does not require or supply a kernel patch, custom
 kernel module, module blacklist, sysctl setting, special udev rule, or boot
 parameter. It needs a system that permits this direct hardware access.
 
-Start it as root, normally through `sudo` or the startup service. Although the
-source contains a function intended to drop privileges to `nobody`, its
-`setgid(...) && setuid(...)` expression skips `setuid` when `setgid` succeeds.
-Do not assume the daemon becomes unprivileged after startup.
+Start it as root, normally through `sudo` or the startup service. After hardware
+initialization it clears supplementary groups and changes real, effective, and
+saved user/group IDs to `nobody`, or the account selected by `--user`. It verifies
+the transition and refuses to continue on failure. The runtime account must have
+nonzero user and group IDs. A dedicated existing service account can be selected
+with `--user=mediasmartserver`.
 
-Hardware initialization disables the SCH5127 watchdog and configures GPIOs for
-LED control. This is hardware-specific software, not a general-purpose LED tool
+The main process retains only its granted runtime I/O-port permissions. Update
+helpers explicitly revoke inherited port permissions, close other descriptors,
+restore signal delivery, and execute with a small fixed environment and
+`no_new_privs`. The root-owned instance lock is held until process exit.
+
+Hardware initialization validates the LPC identity, SCH5127 device ID (`0x86`),
+and register bases before configuring GPIOs for LED control. The watchdog is
+preserved by default. `--disable-watchdog` explicitly requests the historical
+behavior of clearing the four watchdog registers; use it only when that is the
+intended watchdog policy for the server. This is hardware-specific software, not a general-purpose LED tool
 for arbitrary PCs. It does not provide fan-speed or temperature-monitoring modes.
 
 The source selects hardware using DMI vendor and product strings:
@@ -33,10 +42,12 @@ The source selects hardware using DMI vendor and product strings:
 | `Acer` | `Altos easyStore M2` | Altos M2 |
 | `Acer` | `Aspire easyStore H341` or `Aspire easyStore H342` | H341 |
 | `LENOVO` | `IdeaCentre D400 10023` | H340-compatible |
-| Other vendors, including `HP` | Any | Attempts HP ex48X hardware detection |
+| `HP` or `Hewlett-Packard` | `MediaSmart Server`, `HP MediaSmart Server`, `EX485`, or `EX487` | HP ex48X |
 
-An unrecognized Acer or Lenovo product does not take the HP fallback. Actual
-chipset checks must also succeed. The original README reports testing on an HP
+Unknown vendor/product combinations are rejected. An explicit `--model` override
+accepts `hp-ex48x`, `acer-h340`, `acer-h341`, or `acer-altos-m2`; chipset and register
+checks still apply. An override is for a verified compatible board with different
+DMI text, not for arbitrary hardware. The original README reports testing on an HP
 ex485; code paths for other models are not a guarantee of compatibility.
 
 ## Building from source
@@ -55,10 +66,16 @@ make
 ./mediasmartserverd --version
 ```
 
-`make` cleans previous build outputs and creates `./mediasmartserverd`; it does
-not install it or restart a running copy. There is no `make install` target.
-The Makefile links libudev, libdl, and pthreads. The source uses C++11 features,
-so an older compiler may need an explicit C++11-or-newer language setting.
+`make -j2` builds incrementally and creates `./mediasmartserverd`; it does not
+install it or restart a running copy. There is no `make install` target. The
+Makefile requires a C++17 compiler and links libudev. Objects and generated header
+dependencies are kept in `build/`. The daemon has no update-monitor worker thread.
+
+Run `make test` for hardware-free regression and process-integration tests, and
+`make test-sanitize` for AddressSanitizer/UndefinedBehaviorSanitizer checks. These
+tests do not perform physical port I/O and do not need root. See
+[testing and validation](docs/testing.md) for the read-only benchmark and the
+separate, explicitly invoked physical validation procedure.
 
 `--help` and `--version` exit before hardware initialization and do not need
 root. The version string is hardcoded to `0.0.1` plus compilation date/time;
@@ -76,7 +93,7 @@ The repository includes `lib/systemd/system/mediasmartserver.service`, which run
 /usr/sbin/mediasmartserverd --activity --update-monitor
 ```
 
-It stays in the foreground under systemd, starts as root, and uses
+It stays in the foreground under systemd, starts as root and then drops privileges, and uses
 `Restart=always`. Do not add `-D` to this unit. An explicit `systemctl stop`
 stops it; simply killing its process can cause it to restart.
 
@@ -164,22 +181,22 @@ supported, even though matching letters appear internally in the source.
 | `-D`, `--daemon` | Detach and run in the background. Without this, stay in the foreground. |
 | `-a`, `--activity` | Add drive activity indication to normal disk monitoring. Off by default. |
 | `-u`, `--update-monitor` | Use the system LED for update/reboot notifications. Off by default. |
-| `--brightness=N` | Set shared LED brightness. Effective levels are **0–9**: 0 off, 9 maximum. Values above 9 clamp to 9; negative values skip the brightness change. Omission leaves the current brightness unchanged. |
+| `--brightness=N` | Set shared LED brightness, **0–9**: 0 off, 9 maximum. Other values are rejected. Omission leaves the current brightness unchanged. |
 | `--light-show=N` | Run a continuous drive-bay animation instead of normal monitoring. See the mode table below. Default 0 means no show. |
 | `--xmas` | Turn on both red and blue channels of all four drive-bay LEDs, then exit. This is a static display, distinct from animated light-show mode 1. |
-| `--usb=N` | Set the hardware `OUT_USB_DEVICE` GPIO: 0 clears it, positive values set it, negative values skip the operation. Continues into the selected operating mode. |
+| `--usb=N` | Set the hardware `OUT_USB_DEVICE` GPIO: 0 clears it, 1 sets it. Other values are rejected. Continues into the selected operating mode. |
 | `-v`, `--verbose` | Print additional detection/status information. Repeat (`-vv`) for more detail. |
 | `--debug` | Print low-level hardware and device/activity diagnostics. Repeatable; can produce substantial output. |
-| `--help` | Print abbreviated help and exit. Omits light shows, Xmas, and USB options. |
+| `--help` | Print command-line help and exit before hardware access. |
+| `--model=NAME` | Select a supported hardware model explicitly; chipset checks still apply. |
+| `--user=NAME` | Existing unprivileged runtime account; default `nobody`. |
+| `--disable-watchdog` | Explicitly clear the SCH5127 watchdog registers after validated initialization. |
 | `-V`, `--version` | Print the compiled version/date/time and exit. |
 
-The README/help describe brightness as 0–10 or 1–10, but all four driver
-implementations have a ten-entry table indexed **0–9**. Levels 9 and 10 therefore
-produce the same maximum setting. Brightness is not independently adjustable
-per bay or color.
-
-Numeric arguments use `atoi`, with no strict validation. Use the documented
-integer values; malformed text can become zero rather than produce an error.
+Brightness is not independently adjustable per bay or color. Numeric arguments
+must be unsigned decimal integers in range. Negative values, overflow, trailing
+junk, and unexpected positional arguments are rejected before hardware access.
+If migrating from an old `--brightness=10` command, use `--brightness=9`.
 
 Despite its name and source comments, `--usb` does **not** call filesystem
 `mount`/`umount`, accept a device path, or select a mount point. Its external
@@ -206,25 +223,35 @@ These are alternative invocations, not commands to run together. Stop an
 existing instance before starting one of them.
 
 Disk presence turns the corresponding bay's blue channel on. With `--activity`,
-the monitor checks sysfs disk statistics roughly every 100 ms: outstanding I/O
-turns on red as well as blue, while idle returns to blue. This is sampled
-activity, not a flash for every individual operation. Red here does not mean
+a monotonic timer samples sysfs statistics every 100 ms. Changes in completed
+read/write/discard/flush counters, or outstanding I/O, turn on red as well as
+blue; idle returns to blue. This detects short bursts completed between samples
+once a baseline is established. It is still sampled activity, not a flash per
+operation. Descriptors are retained while the disk is present, and unchanged
+LED state causes no GPIO access. Activity sampling stops when no eligible disks
+are present or the option is disabled. Red here does not mean
 a disk failure; the daemon does not check SMART health or RAID status.
 
-Initial enumeration selects ATA disks through udev. Bay assignment is derived
-from ATA/SCSI host paths rather than `/dev/sda` ordering. The original HP ex485
+Initial enumeration and live events select whole ATA block devices through udev.
+Bay assignment uses controller-local ATA `port_no` attributes: ports 1–4 on
+`0000:00:1f.2` map to indices 0–3. External controllers, partitions, and ports
+outside that mapping are excluded. Global `ataN`, `hostN`, and `/dev/sdX` numbering
+do not determine bay assignment. The original HP ex485
 documentation numbers bays bottom to top, 1–4; internal LED indices are 0–3.
 Mapping depends on the hardware and device topology.
 
-Hotplug events update presence, but the activity-statistics list is built at
-startup. A newly introduced disk may need a daemon restart for activity
-monitoring to include it.
+Reception starts before enumeration. Queued events are reconciled against current
+sysfs state, and device inventory is reconciled every 30 seconds as a fallback.
+Inserted disks automatically enter activity monitoring. Removal closes their
+statistics descriptor and clears both colors; replacement resets the counter
+baseline. Monitor errors trigger reconnection and inventory reconciliation.
 
 ## System LED update notifications
 
-`--update-monitor` invokes `/usr/lib/update-notifier/apt-check` immediately and
-then approximately every 15 minutes. The historical package dependency is
-`update-notifier-common`. It also checks `/var/run/reboot-required`.
+`--update-monitor` invokes `/usr/lib/update-notifier/apt-check` asynchronously at
+startup and then approximately every 15 minutes. Changes to dpkg status and apt
+list files trigger a debounced check, with only one helper running at a time. The historical package dependency is
+`update-notifier-common`. It independently watches `/run/reboot-required`, with a 30-second reconciliation fallback.
 
 | Condition, in priority order | System LED |
 | --- | --- |
@@ -233,11 +260,13 @@ then approximately every 15 minutes. The historical package dependency is
 | Other updates available | Blue |
 | No updates or reboot required | Off |
 
-This reports available updates; it does not install them. If the helper is
-unavailable or its output cannot be parsed, the update-monitor thread stops and
-clears the system LED. Normal disk monitoring can continue. Use `-vv` to see
-update-monitor diagnostics. The reboot indication also depends on successful
-execution/parsing of the update check.
+This reports available updates; it does not install them. The helper has a
+30-second execution deadline and a 4 KiB output limit. Failure is logged and
+retried after 60 seconds; it is not interpreted as zero updates. The last valid
+update indication is retained on failure, or stays off if no valid result has
+been received. Reboot-required always takes priority and is independent of
+helper success. Shutdown terminates the helper process group, allows 500 ms for
+exit, then uses SIGKILL and reaps it. Disk monitoring continues during checks.
 
 ## Light shows
 
@@ -272,19 +301,17 @@ sudo ./mediasmartserverd --light-show=1 --brightness=4
 sudo ./mediasmartserverd --xmas --brightness=4
 ```
 
-Modes 0 and negative numbers fall through to normal monitoring. Values above
-13 are not rejected: the arithmetic repeats patterns and falls back to blue.
-Use 1–13 for predictable selection.
+Mode 0 selects normal monitoring; modes 1–13 select shows. Other values are rejected.
 
 Pulse modes vary shared brightness from 1 up to 9 and back, overriding the
-initial `--brightness` setting. Shows do not restore the previous brightness
-or clear their final frame on exit. Restart normal monitoring with an explicit
+initial `--brightness` setting. Shows clear their final frame on exit but do not restore the previous brightness. Restart normal monitoring with an explicit
 brightness if you want to restore a known setting.
 
 Mode precedence is fixed, independent of argument order:
 
-1. Initialize hardware and apply `--usb` if supplied.
-2. Detach if requested, switch off the system LED, and apply brightness.
+1. Acquire the instance lock, detach if requested, validate/initialize hardware,
+   optionally disable the watchdog, and drop privileges.
+2. Apply `--usb` if supplied, switch off the system LED, and apply brightness.
 3. If `--xmas` is present, light all bay channels and exit.
 4. Otherwise, if `--light-show` is positive, run that show until interrupted.
 5. Otherwise, start normal disk monitoring and the optional update monitor.
@@ -296,8 +323,10 @@ activity or update monitoring even if `--activity`/`--update-monitor` is supplie
 
 There is no RPC/socket interface, runtime command client, configuration file,
 PID file, or reload option. Options apply to the process being launched; a new
-invocation does not send commands to the running daemon. Separate instances
-can overwrite each other's LED state and interfere with register updates.
+invocation does not send commands to the running daemon. A process holds an
+exclusive lock at `/run/mediasmartserverd.lock` before initializing hardware;
+a second current-version instance fails before hardware access. Older versions
+do not honor this lock, so stop the old service before upgrading or testing.
 
 If installed with systemd, stop the service before running a foreground mode,
 then start it again afterward:
@@ -323,8 +352,9 @@ by another startup mechanism, stop it through that manager to prevent automatic
 restarts. After a show, restart your normal monitoring command with an explicit
 `--brightness=N` to restore a known brightness.
 
-In normal monitoring, SIGINT/SIGTERM interrupts the wait and the shutdown path
-clears the tracked bay LEDs and stops the update monitor. The old blinking
+SIGINT/SIGTERM are consumed through the event loop, including when delivered
+between waits. Shutdown clears the bay/system LEDs and stops/reaps the helper.
+Shows also clear LEDs; `--xmas` intentionally leaves the static display on. The old blinking
 system LED behavior is not restored. Background mode redirects standard output
 and error through `daemon(0, 0)`; use foreground execution for diagnostics.
 
@@ -333,13 +363,13 @@ and error through `daemon(0, 0)`; use foreground execution for diagnostics.
 | Symptom | What to check |
 | --- | --- |
 | `ioperm` error / “Try running as root” | Start as root on supported hardware; the environment must allow direct I/O-port access. |
-| “Failed to find an LED control interface” | Use `--verbose --debug` in the foreground after stopping the existing instance; inspect DMI selection and chipset detection. |
+| Unsupported DMI or failed chipset validation | Verify the exact model and hardware; use a model override only for a known compatible board. |
 | LEDs remain dark | Brightness may be zero from a previous run. Try an explicit nonzero brightness when restarting. |
 | Bay colors change unexpectedly during a show | Check for another running instance or an automatically restarting service. |
 | No update notification | Check the `apt-check` helper and use `-vv`; this feature is optional and distribution-specific. |
-| Newly added disk has no activity indication | Restart monitoring to rebuild the startup statistics list. |
+| Newly added disk has no activity indication | Inspect `-vv` inventory and `--debug` state transitions; confirm it is on one of the four supported internal ports. Statistics failures retry automatically. |
 | No useful logs from a manual background launch | Stop it and reproduce in the foreground without `-D`. |
-| `--help` omits an option or disagrees about brightness | Use this guide and the parser/driver implementations below. |
+| Invalid brightness argument after upgrade | Use an integer from 0 to 9; the old maximum value 10 is now rejected. |
 
 Primary implementation references:
 

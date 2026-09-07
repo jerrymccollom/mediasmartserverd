@@ -27,44 +27,34 @@
 /// distribution.
 ///
 /////////////////////////////////////////////////////////////////////////////
-#ifndef INCLUDED_LED_CONTROL_SCH5127_BASE
-#define INCLUDED_LED_CONTROL_SCH5127_BASE
-
-//- includes
+// Altered version, 2026: validated discovery and owned, injectable port access.
+#pragma once
 #include "led_control_base.h"
 #include "mediasmartserverd.h"
+#include "port_io.h"
 #include <algorithm>
-#include <assert.h>
+#include <cassert>
 #include <iostream>
-#include <sys/io.h>
 
-/////////////////////////////////////////////////////////////////////////////
-/// base class for LED control over systems using the SCH5127 chipset
 class LedControlSCH5127Base : public LedControlBase {
 public:
-	/// constructor
-	LedControlSCH5127Base( )
-		:	io_lpc_gpiobase_( 0 )
-		,	io_sch5127_regs_( 0 )
-	{ }
-	
-	/// destructor
-	virtual ~LedControlSCH5127Base( ) { }
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// attempt to initialise device
-	virtual bool Init( ) {
-		if ( !initPciLpc_( )  ) return false;
-		if ( !initSch5127_( ) ) return false;
-		
-		disableWatchDog_( );
-		
-		return true;
-	}
-	
+    explicit LedControlSCH5127Base(PortIo& io = NativePortIo::instance()) : io_(io) {}
+    ~LedControlSCH5127Base() override {
+        for (unsigned i = 0; i < 65536;) {
+            if (!permissions_[i]) { ++i; continue; }
+            const unsigned start = i;
+            while (i < 65536 && permissions_[i]) ++i;
+            try { io_.permission(start, i - start, false); } catch (...) {}
+        }
+    }
+    bool Init() override { return initPciLpc_() && initSch5127_(); }
+    void DisableWatchdog() override {
+        // Explicit opt-in only; preserve the watchdog during ordinary startup.
+        IoGrant grant(io_, io_sch5127_regs_ + REG_WDT_TIME_OUT, 4);
+        for (unsigned i = REG_WDT_TIME_OUT; i <= REG_WDT_CTRL; ++i)
+            outb(0, io_sch5127_regs_ + i);
+    }
 protected:
-	/////////////////////////////////////////////////////////////////////////
-	/// IHR9 General Purpose I/O Registers
 	enum {
 		GPIO_USE_SEL		= 0x00,	///< GPIO Use Select
 		GP_IO_SEL			= 0x04,	///< GPIO Input/Output Select
@@ -107,220 +97,90 @@ protected:
 		HWM_PWM3_DUTY_CYCLE	= 0x32,	///< PWM3 Current Duty Cycle
 	};
 	
-	/////////////////////////////////////////////////////////////////////////
-	/// is this an expected PCI device and vnedor id?
-	virtual bool chkPciDeviceVendorId_( unsigned int did_vid ) const = 0;
-	
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// initialise LPC Interface controller via PCI
-	bool initPciLpc_( ) {
-		// The LPC bridge function of the ICH9 resides in PCI Device 31:Function 0
-		enum {
-			CONF_VENDOR_ID	= 0x8000F800,   ///< Vendor Identification (enable, bus 0, device 31, function 0, register 0x00)
-			CONF_GPIOBASE	= 0x8000F848,   ///< GPIO Base address     (enable, bus 0, device 31, function 0, register 0x48)
-		};
-		
-		// PCI configuration space
-		const unsigned int PCI_CONFIG_ADDRESS	= 0x0CF8;
-		const unsigned int PCI_CONFIG_DATA		= 0x0CFC;
-		
-		//
-		if ( ioperm(PCI_CONFIG_DATA,    4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(PCI_CONFIG_ADDRESS, 4, 1) ) throw ErrnoException("ioperm");
-		
-		// retrieve vendor and device identification
-		outl( CONF_VENDOR_ID, PCI_CONFIG_ADDRESS );
-		const unsigned int did_vid = inl( PCI_CONFIG_DATA );
-		if ( !chkPciDeviceVendorId_(did_vid) ) return false;
-		
-		// retrieve GPIO Base Address
-		outl( CONF_GPIOBASE, PCI_CONFIG_ADDRESS );
-		io_lpc_gpiobase_ = inl( PCI_CONFIG_DATA );
-		
-		// sanity check the address
-		// (only bits 15:6 provide an address while the rest are reserved as always being zero)
-		if ( 0x1 != (io_lpc_gpiobase_ & 0xFFFF007F) ) {
-			if ( debug || verbose > 0 ) std::cerr << Desc() << ": Expected 0x1 but got " << (io_lpc_gpiobase_ & 0xFFFF007F) << '\n';
-			return false;
-		}
-		io_lpc_gpiobase_ &= ~0x1; // remove hardwired 1 which indicates I/O space
-		
-		// finished with these ports
-		ioperm( PCI_CONFIG_DATA,    4, 0 );
-		ioperm( PCI_CONFIG_ADDRESS, 4, 0 );
-		
-		return true;
-	}	
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// initialise SuperI/O for SCH5127 and retrieve runtime registers offset
-	bool initSch5127_( ) {
-		enum {
-			IDX_LDN			= 0x07,	///< Logical Device Number
-			IDX_ID			= 0x20,	///< device identification
-			IDX_BASE_MSB	= 0x60,	///< base address MSB register
-			IDX_BASE_LSB	= 0x61,	///< base address LSB register
-			IDX_ENTER		= 0x55,	///< enter configuration mode
-			IDX_EXIT		= 0xaa,	///< exit configuration mode
-		};
-		
-		// try LPC SIO @ 0x2e
-		unsigned int sio_addr = 0x2e;
-		unsigned int sio_data = sio_addr + 1;
-		if ( ioperm(sio_addr, 1, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(sio_data, 1, 1) ) throw ErrnoException("ioperm");
-		
-		// enter configuration mode
-		outb( IDX_ENTER, sio_addr );
-		
-		// retrieve identification
-		outb( IDX_ID, sio_addr );
-		const unsigned int device_id = inb( sio_data );
-		if ( debug ) std::cout << Desc() << ": Device 0x" << std::hex << device_id << std::dec << "\n";
-		
-		// 
-		{
-			outb( 0x26, sio_addr );
-			const unsigned int in = inb( sio_data );
-			if ( 0x4e == in ) {
-				outb( IDX_EXIT, sio_addr );
-				
-				// finished with these ports
-				ioperm( sio_addr, 1, 0 );
-				ioperm( sio_data, 1, 0 );
-				
-				// and switch to these if we are told to
-				if ( debug ) std::cout << Desc() << ": Using 0x4e\n";
-				sio_addr = 0x4e;
-				sio_data = sio_addr + 1;
-				
-				if ( ioperm(sio_addr, 1, 1) ) throw ErrnoException("ioperm");
-		        if ( ioperm(sio_data, 1, 1) ) throw ErrnoException("ioperm");
-				
-				outb( IDX_ENTER, sio_addr );
-			}
-		}
-		
-		// select logical device 0x0a (base address?)
-		outb( IDX_LDN, sio_addr );
-		outb( 0x0a, sio_data );
-		
-		// get base address of runtime registers
-		outb( IDX_BASE_MSB, sio_addr );
-		const unsigned int index_msb = inb( sio_data );
-		outb( IDX_BASE_LSB, sio_addr );
-		const unsigned int index_lsb = inb( sio_data );
-		
-		io_sch5127_regs_ = index_msb << 8 | index_lsb;
-		
-		// exit configuration
-		outb( IDX_EXIT, sio_addr );
-		
-		// finished with SuperI/O ports
-		ioperm(sio_data, 1, 0);
-		ioperm(sio_addr, 1, 0);
-		
-		return true;
-	}
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// disable watchdog timer
-	void disableWatchDog_( ) {
-		// watchdog registers to zero out
-		const int WDT_REGS[] = { REG_WDT_VAL, REG_WDT_TIME_OUT, REG_WDT_CFG, REG_WDT_CTRL };
-		const size_t WDT_REGS_CNT = sizeof(WDT_REGS) / sizeof(WDT_REGS[0]);
-		
-		// determine the I/O range of those registers
-		const int reg_min = *std::min_element( WDT_REGS, WDT_REGS + WDT_REGS_CNT );
-		const int reg_max = *std::max_element( WDT_REGS, WDT_REGS + WDT_REGS_CNT );
-		const int reg_cnt = reg_max - reg_min + 1;
-		
-		// get access to the entire range
-		if ( ioperm(io_sch5127_regs_ + reg_min, reg_cnt, 1) ) throw ErrnoException("ioperm");
-		
-		// zero them out
-		for ( size_t i = 0; i < WDT_REGS_CNT; ++i ) {
-			outb( 0, io_sch5127_regs_ + WDT_REGS[i] );
-		}
-		
-		// done
-		ioperm(io_sch5127_regs_ + reg_min, reg_cnt, 0);
-	}
-	
-	/////////////////////////////////////////////////////////////////////////
-	static void setBit32_( int bit, int& bits1, int& bits2 ) {
-		int& bits = (bit < 32) ? bits1 : bits2;
-		bits |= 1 << bit;
-	}
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// set/clear bit state
-	void doBits_( unsigned int bits, unsigned int port, bool state ) {
-		const unsigned int val = inl( port );
-		const unsigned int new_val = ( state )
-			?	val | bits
-			:	val & ~bits
-		;
-		if ( val != new_val ) outl( new_val, port );
-	}
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// set/clear appropriate GPIO level via io_lpc_gpiobase_
-	void setGpLpcLvl_( int bit, bool state ) {
-		doBits_(
-			(1 << (bit % 32)),
-			io_lpc_gpiobase_ + ((bit < 32) ? GP_LVL : GP_LVL2),
-			state
-		);
-	}
-	
-	/////////////////////////////////////////////////////////////////////////
-	/// set/clear appropriate GPIO level via io_sch5127_regs_ runtime regs
-	void setGpRegsLvl_( int bit, bool state ) {
-		const int reg = ((bit >> 4) & 0xF) - 1;
-		assert( reg >= 0 );
-		
-		doBits_(
-			(1 << (bit & 0xF)),
-			io_sch5127_regs_ + REG_GP1 + reg,
-			state
-		);
-	}
 
-	/////////////////////////////////////////////////////////////////////////
-	/// select specified I/Os as inputs
-	void setGpioSelInput_( int bits1, int bits2 ) {
-		// Use Select (0 = native function, 1 = GPIO)
-		{
-			const unsigned int gpio_use_sel  = io_lpc_gpiobase_ + GPIO_USE_SEL;
-			const unsigned int gpio_use_sel2 = io_lpc_gpiobase_ + GPIO_USE_SEL2;
-			if ( ioperm(gpio_use_sel,  4, 1) ) throw ErrnoException("ioperm");
-			if ( ioperm(gpio_use_sel2, 4, 1) ) throw ErrnoException("ioperm");
-			
-			outl( inl(gpio_use_sel)  | bits1, gpio_use_sel  );
-			outl( inl(gpio_use_sel2) | bits2, gpio_use_sel2 );
-			
-			ioperm( gpio_use_sel, 4, 0 );
-			ioperm( gpio_use_sel2, 4, 0 );
-		}
-		// Input/Output select (0 = Output, 1 = Input)
-		{
-			const unsigned int gp_io_sel  = io_lpc_gpiobase_ + GP_IO_SEL;
-			const unsigned int gp_io_sel2 = io_lpc_gpiobase_ + GP_IO_SEL2;
-			if ( ioperm(gp_io_sel,  4, 1) ) throw ErrnoException("ioperm");
-			if ( ioperm(gp_io_sel2, 4, 1) ) throw ErrnoException("ioperm");
-			
-			outl( inl(gp_io_sel)  & ~bits1, gp_io_sel  );
-			outl( inl(gp_io_sel2) & ~bits2, gp_io_sel2 );
-			
-			ioperm( gp_io_sel, 4, 0 );
-			ioperm( gp_io_sel2, 4, 0 );
-		}
-	}
-	
-	unsigned int io_lpc_gpiobase_;	///< I/O offset to LPC GPIO on the IHR9
-	unsigned int io_sch5127_regs_;	///< I/O offset to SCH5127 runtime registers
+    virtual bool chkPciDeviceVendorId_(unsigned did_vid) const = 0;
+    bool initPciLpc_() {
+        IoGrant address(io_, 0xcf8, 4), data(io_, 0xcfc, 4);
+        outl(0x8000f800, 0xcf8);
+        if (!chkPciDeviceVendorId_(inl(0xcfc))) return false;
+        outl(0x8000f848, 0xcf8);
+        const uint32_t base = inl(0xcfc);
+        if ((base & 0xffff007fU) != 1 || (base & ~1U) == 0) return false;
+        io_lpc_gpiobase_ = base & ~1U;
+        return true;
+    }
+    bool initSch5127_() {
+        // Datasheet DS00002081A: global ID 0x86, LDN 0x0a runtime block,
+        // 128-byte alignment within the 12-bit address space.
+        for (unsigned address : {0x2eU, 0x4eU}) {
+            IoGrant grant(io_, address, 2);
+            struct ConfigExit {
+                PortIo& io; unsigned address;
+                ~ConfigExit() { try { io.write8(0xaa, address); } catch (...) {} }
+            } exit{io_, address};
+            outb(0x55, address);
+            outb(0x20, address);
+            if (inb(address + 1) != 0x86) continue;
+            outb(0x07, address); outb(0x0a, address + 1);
+            outb(0x60, address); const unsigned high = inb(address + 1);
+            outb(0x61, address); const unsigned low = inb(address + 1);
+            const unsigned base = (high << 8) | low;
+            if (base < 0x100 || base > 0xf00 || (base & 0x7f)) return false;
+            if (base < io_lpc_gpiobase_ + 0x40 && io_lpc_gpiobase_ < base + 0x80)
+                return false;
+            io_sch5127_regs_ = base;
+            return true;
+        }
+        return false;
+    }
+    static void setBit32_(int bit, uint32_t& first, uint32_t& second) {
+        if (bit < 0 || bit > 60) throw std::out_of_range("GPIO index");
+        (bit < 32 ? first : second) |= uint32_t{1} << (bit % 32);
+    }
+    void doBits_(uint32_t mask, unsigned port, bool state) {
+        const auto old = inl(port);
+        const auto value = state ? old | mask : old & ~mask;
+        if (old != value) outl(value, port);
+    }
+    void setGpLpcLvl_(int bit, bool state) {
+        if (bit < 0 || bit > 60) throw std::out_of_range("GPIO index");
+        doBits_(uint32_t{1} << (bit % 32),
+                io_lpc_gpiobase_ + (bit < 32 ? GP_LVL : GP_LVL2), state);
+    }
+    void setGpRegsLvl_(int bit, bool state) {
+        // Preserve the physical bit addressed by historical H341 wide masks,
+        // but touch only its byte: e.g. 0x4b addresses GP5 bit 3.
+        const int offset = ((bit >> 4) & 0xf) - 1 + (bit & 0xf) / 8;
+        if (offset < 0 || offset > 5) throw std::out_of_range("SCH GPIO index");
+        const unsigned port = io_sch5127_regs_ + REG_GP1 + offset;
+        const uint8_t mask = uint8_t{1} << (bit & 7);
+        const uint8_t old = inb(port);
+        const uint8_t value = state ? old | mask : old & ~mask;
+        if (old != value) outb(value, port);
+    }
+    void setGpioSelInput_(uint32_t first, uint32_t second) {
+        // Historical name: these bits are configured as OUTPUTS.
+        for (unsigned bank = 0; bank < 2; ++bank) {
+            const unsigned use = io_lpc_gpiobase_ + (bank ? GPIO_USE_SEL2 : GPIO_USE_SEL);
+            const unsigned direction = io_lpc_gpiobase_ + (bank ? GP_IO_SEL2 : GP_IO_SEL);
+            const auto mask = bank ? second : first;
+            IoGrant use_grant(io_, use, 4), dir_grant(io_, direction, 4);
+            doBits_(mask, use, true);
+            doBits_(mask, direction, false);
+        }
+    }
+    PortIo& io_;
+    std::bitset<65536> permissions_;
+    unsigned io_lpc_gpiobase_ = 0;
+    unsigned io_sch5127_regs_ = 0;
+    int ioperm(unsigned port, unsigned count, int enable) {
+        if (port > 65535 || count > 65536 - port) throw std::out_of_range("I/O permission");
+        const int result = io_.permission(port, count, enable);
+        if (!result) for (unsigned i = port; i < port + count; ++i) permissions_[i] = enable;
+        return result;
+    }
+    uint8_t inb(unsigned port) { return io_.read8(port); }
+    uint32_t inl(unsigned port) { return io_.read32(port); }
+    void outb(uint8_t value, unsigned port) { io_.write8(value, port); }
+    void outl(uint32_t value, unsigned port) { io_.write32(value, port); }
 };
-
-#endif // INCLUDED_LED_CONTROL_SCH5127_BASE

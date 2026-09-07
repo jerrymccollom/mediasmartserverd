@@ -1,3 +1,33 @@
+# mediasmartserverd
+
+A Linux x86 daemon controlling drive-bay and system LEDs on supported HP
+MediaSmart and Acer/Lenovo servers.
+
+See [ABOUT.MD](ABOUT.MD) for installation, supported hardware, all options, and
+upgrade behavior. See [docs/testing.md](docs/testing.md) for regression tests,
+benchmarks, and hardware validation.
+
+```sh
+sudo apt install build-essential libudev-dev
+make -j2
+make test
+./mediasmartserverd --help
+```
+
+Monitoring uses a single event loop: udev for disk changes, 100 ms sampling for
+activity, filesystem notifications for reboot/package changes, and an
+asynchronous bounded update helper. Hotplugged disks are tracked immediately;
+unchanged LED state causes no GPIO access.
+
+Start as root on supported hardware; the daemon drops to `nobody` after
+initialization. Unknown hardware is rejected, competing instances are locked
+out, and the watchdog is preserved unless `--disable-watchdog` is specified.
+
+The original project notes follow for historical context. Their command-line
+ranges and installation instructions predate the current implementation.
+
+---
+
 mediasmartserverd
 =================
 

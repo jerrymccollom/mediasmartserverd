@@ -31,7 +31,8 @@
 #define INCLUDED_LED_CONTROL_BASE
 
 //- includes
-#include <tr1/memory>
+#include <memory>
+#include <stdexcept>
 
 //- constants
 enum {
@@ -54,6 +55,7 @@ public:
 	virtual const char* Desc( ) const = 0;
 	virtual bool Init( ) = 0;
 	
+	virtual void DisableWatchdog() { throw std::runtime_error("Watchdog control unavailable"); }
 	virtual void MountUsb( bool state ) = 0;
 	virtual void Set( int led_type, size_t led_idx, bool state ) = 0;
 	virtual void SetBrightness( int val ) = 0;
@@ -72,6 +74,6 @@ private:
 	LedControlBase( const LedControlBase& rhs );
 	const LedControlBase& operator=( const LedControlBase& rhs );
 };
-typedef std::tr1::shared_ptr< LedControlBase > LedControlPtr;
+typedef std::shared_ptr< LedControlBase > LedControlPtr;
 
 #endif // INCLUDED_LED_CONTROL_BASE

@@ -38,6 +38,7 @@
 #ifndef INCLUDED_LED_ACERH341
 #define INCLUDED_LED_ACERH341
 
+// Altered version, 2026: injectable I/O and unsigned GPIO masks.
 //- includes
 #include "led_control_sch5127_base.h"
 #include "mediasmartserverd.h"
@@ -48,7 +49,7 @@
 class LedAcerH341 : public LedControlSCH5127Base {
 public:
 	/// constructor
-	LedAcerH341( ) { }
+	LedAcerH341(PortIo& io = NativePortIo::instance()) : LedControlSCH5127Base(io) { }
 	
 	/// destructor
 	virtual ~LedAcerH341( ) { }
@@ -65,17 +66,15 @@ public:
 		// set up io permissions to other ports we may use
 		if ( ioperm(io_sch5127_regs_ + REG_HWM_INDEX, 1, 1) ) throw ErrnoException("ioperm");
 		if ( ioperm(io_sch5127_regs_ + REG_HWM_DATA,  1, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_sch5127_regs_ + REG_GP1,       4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_sch5127_regs_ + REG_GP2,       4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_sch5127_regs_ + REG_GP3,       4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_sch5127_regs_ + REG_GP4,       4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_sch5127_regs_ + REG_GP5,       4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_sch5127_regs_ + REG_GP6,       4, 1) ) throw ErrnoException("ioperm");
+		if ( ioperm(io_sch5127_regs_ + REG_GP1,       1, 1) ) throw ErrnoException("ioperm");
+		if ( ioperm(io_sch5127_regs_ + REG_GP2,       1, 1) ) throw ErrnoException("ioperm");
+		if ( ioperm(io_sch5127_regs_ + REG_GP3,       1, 1) ) throw ErrnoException("ioperm");
+		if ( ioperm(io_sch5127_regs_ + REG_GP4,       1, 1) ) throw ErrnoException("ioperm");
+		if ( ioperm(io_sch5127_regs_ + REG_GP5,       1, 1) ) throw ErrnoException("ioperm");
+		if ( ioperm(io_sch5127_regs_ + REG_GP6,       1, 1) ) throw ErrnoException("ioperm");
 		
 		//
 		if ( ioperm(io_lpc_gpiobase_ + GPO_BLINK,	4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_lpc_gpiobase_ + GP_IO_SEL,	4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_lpc_gpiobase_ + GP_IO_SEL2,	4, 1) ) throw ErrnoException("ioperm");
 		if ( ioperm(io_lpc_gpiobase_ + GP_LVL,		4, 1) ) throw ErrnoException("ioperm");
 		if ( ioperm(io_lpc_gpiobase_ + GP_LVL2,		4, 1) ) throw ErrnoException("ioperm");
 		
@@ -92,9 +91,9 @@ public:
 		if ( led_type & LED_RED  ) setGpLpcLvl_( OUT_SYSTEM_RED,  !on_off_state );
 		
 		const bool blink_state  = ( LED_BLINK == state );
-		int val = 0;
-		if ( led_type & LED_BLUE ) val |= 1 << OUT_SYSTEM_BLUE;
-		if ( led_type & LED_RED  ) val |= 1 << OUT_SYSTEM_RED;
+		uint32_t val = 0;
+		if ( led_type & LED_BLUE ) val |= uint32_t{1} << OUT_SYSTEM_BLUE;
+		if ( led_type & LED_RED  ) val |= uint32_t{1} << OUT_SYSTEM_RED;
 		if ( val ) doBits_( val, io_lpc_gpiobase_ + GPO_BLINK, blink_state );
 	}
 	
@@ -181,7 +180,7 @@ protected:
 	/// enable LEDs
 	void enableLeds_( ) {
 		// work out which bits we need
-		int bits1 = 0, bits2 = 0;
+		uint32_t bits1 = 0, bits2 = 0;
 		setBit32_( OUT_USB_DEVICE,	bits1, bits2 );
 		setBit32_( OUT_USB_LED,		bits1, bits2 );
 		setBit32_( OUT_POWER,		bits1, bits2 );

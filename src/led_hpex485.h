@@ -30,6 +30,7 @@
 #ifndef INCLUDED_LED_HPEX485
 #define INCLUDED_LED_HPEX485
 
+// Altered version, 2026: injectable I/O and unsigned GPIO masks.
 //- includes
 #include "led_control_sch5127_base.h"
 #include "mediasmartserverd.h"
@@ -39,7 +40,7 @@
 class LedHpEx48X : public LedControlSCH5127Base {
 public:
 	/// constructor
-	LedHpEx48X( ) { }
+	LedHpEx48X(PortIo& io = NativePortIo::instance()) : LedControlSCH5127Base(io) { }
 	
 	/// destructor
 	virtual ~LedHpEx48X( ) { }
@@ -59,8 +60,6 @@ public:
 		
 		//
 		if ( ioperm(io_lpc_gpiobase_ + GPO_BLINK,	4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_lpc_gpiobase_ + GP_IO_SEL,	4, 1) ) throw ErrnoException("ioperm");
-		if ( ioperm(io_lpc_gpiobase_ + GP_IO_SEL2,	4, 1) ) throw ErrnoException("ioperm");
 		if ( ioperm(io_lpc_gpiobase_ + GP_LVL,		4, 1) ) throw ErrnoException("ioperm");
 		if ( ioperm(io_lpc_gpiobase_ + GP_LVL2,		4, 1) ) throw ErrnoException("ioperm");
 		
@@ -77,9 +76,9 @@ public:
 		if ( led_type & LED_RED  ) setGpLpcLvl_( OUT_SYSTEM_RED,  !on_off_state );
 		
 		const bool blink_state  = ( LED_BLINK == state );
-		int val = 0;
-		if ( led_type & LED_BLUE ) val |= 1 << OUT_SYSTEM_BLUE;
-		if ( led_type & LED_RED  ) val |= 1 << OUT_SYSTEM_RED;
+		uint32_t val = 0;
+		if ( led_type & LED_BLUE ) val |= uint32_t{1} << OUT_SYSTEM_BLUE;
+		if ( led_type & LED_RED  ) val |= uint32_t{1} << OUT_SYSTEM_RED;
 		if ( val ) doBits_( val, io_lpc_gpiobase_ + GPO_BLINK, blink_state );
 	}
 	
@@ -162,7 +161,7 @@ protected:
 	/// enable LEDs
 	void enableLeds_( ) {
 		// work out which bits we need
-		int bits1 = 0, bits2 = 0;
+		uint32_t bits1 = 0, bits2 = 0;
 		for ( size_t i = 0; i < MAX_HDD_LEDS; ++i ) {
 			setBit32_( ioLedBlue_( i ), bits1, bits2 );
 			setBit32_( ioLedRed_( i ),  bits1, bits2 );

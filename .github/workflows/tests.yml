@@ -1,0 +1,17 @@
+name: tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libudev-dev
+      - name: Build and test (no hardware I/O)
+        run: make -j2 all test test-cli
+      - name: Address and undefined behavior sanitizers
+        run: make -j2 test-sanitize

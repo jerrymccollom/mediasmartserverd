@@ -1,37 +1,47 @@
 SHELL = /bin/bash
+CXX ?= g++
+CPPFLAGS ?= -Isrc
+CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic
+LDLIBS = -ludev
+BUILD ?= build
+SOURCES = runtime device_monitor update_monitor helper_process event_loop hardware light_show
+OBJECTS = $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
 
-# compiler and flags
-CC = gcc
-CXX = g++
-FLAGS = -Wall -O2
-#FLAGS = -Wall -g
-CFLAGS = $(FLAGS)
-CXXFLAGS = $(CFLAGS)
-LDFLAGS = -ludev -ldl -lpthread
+.PHONY: all clean test test-sanitize prepare-for-packaging package-unsigned package-signed
+all: mediasmartserverd
 
-# build libraries and options
-all: clean mediasmartserverd
+$(BUILD):
+	mkdir -p $@
+
+$(BUILD)/%.o: src/%.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+mediasmartserverd: $(OBJECTS) $(BUILD)/mediasmartserverd.o
+	$(CXX) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+$(BUILD)/tests: tests/tests.cpp $(OBJECTS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(BUILD)/tests.d $< $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $@
+
+$(BUILD)/helper-fixture: tests/helper_fixture.cpp | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(LDFLAGS) -o $@
+
+test: $(BUILD)/tests $(BUILD)/helper-fixture
+	./$(BUILD)/tests $(abspath $(BUILD)/helper-fixture)
+
+test-sanitize:
+	$(MAKE) BUILD=build/sanitize CXXFLAGS='-O1 -g -std=c++17 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie' LDFLAGS='-fsanitize=address,undefined -no-pie' test
 
 clean:
-	rm *.o mediasmartserverd core -f
+	$(RM) -r build
+	$(RM) *.o mediasmartserverd core
 
-device_monitor.o: src/device_monitor.cpp
-	$(CXX) $(CXXFLAGS) -o $@ -c $^
-
-update_monitor.o: src/update_monitor.cpp
-	$(CXX) $(CXXFLAGS) -o $@ -c $^ -pthread
-
-mediasmartserverd.o: src/mediasmartserverd.cpp
-	$(CXX) $(CXXFLAGS) -o $@ -c $^
-
-mediasmartserverd: device_monitor.o update_monitor.o mediasmartserverd.o
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+-include $(OBJECTS:.o=.d) $(BUILD)/mediasmartserverd.d $(BUILD)/tests.d
 
 prepare-for-packaging:
 	@if [ "$(PACKAGE_VERSION)" != "" ]; then \
 		cd ..; \
 		mkdir mediasmartserver; \
-		cp -RLv mediasmartserverd/{LICENSE,Makefile,readme.txt,README.md,src,debian,etc} mediasmartserver; \
+		cp -RLv mediasmartserverd/{LICENSE,Makefile,readme.txt,README.md,ABOUT.MD,improvement-plan.md,src,debian,etc,lib,tests,docs} mediasmartserver; \
 		tar cfz mediasmartserver-$(PACKAGE_VERSION).tar.gz mediasmartserver; \
 		rm -rf mediasmartserver; \
 		bzr dh-make mediasmartserver $(PACKAGE_VERSION) mediasmartserver-$(PACKAGE_VERSION).tar.gz; \
@@ -57,3 +67,18 @@ package-signed: prepare-for-packaging
 #    2) cd ../mediasmartserver;
 #    3) debuild -S
 
+
+$(BUILD)/benchmark: tests/benchmark.cpp $(OBJECTS) | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $@
+
+.PHONY: benchmark
+benchmark: $(BUILD)/benchmark
+	./$(BUILD)/benchmark before
+	./$(BUILD)/benchmark after
+
+$(BUILD)/privilege-check: tests/privilege_check.cpp $(BUILD)/runtime.o $(BUILD)/helper_process.o | $(BUILD)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
+
+.PHONY: test-cli
+test-cli: mediasmartserverd
+	python3 tests/cli_test.py ./mediasmartserverd
