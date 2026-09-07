@@ -38,249 +38,116 @@
  *    distribution.
  */
 
-#include <iostream>
-#include <fstream>
-#include <pthread.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-
-#include "errno_exception.h"
-#include "mediasmartserverd.h"
+// Altered version, 2026: no worker threads or blocking package checks.
 #include "update_monitor.h"
+#include <iostream>
+#include <sys/inotify.h>
+#include <sys/stat.h>
 
-/***********************************************************
-* Public                                                   *
-***********************************************************/
-/**
- * Constructor (explicit).
- * Initialize the LED control interface.
- * @param leds LED control interface needed for accessing LEDs.
- * @public
- */
-UpdateMonitor::UpdateMonitor(const LedControlPtr& leds)
-{
-	leds_ = leds;
+bool parseUpdateCounts(const std::string& output, UpdateCounts& counts) {
+    const auto text = trim(output);
+    const auto delimiter = text.find(';');
+    UpdateCounts parsed;
+    if (delimiter == std::string::npos ||
+        !parseUnsigned(text.substr(0, delimiter), parsed.total) ||
+        !parseUnsigned(text.substr(delimiter + 1), parsed.security) || parsed.security > parsed.total) return false;
+    counts = parsed;
+    return true;
+}
+UpdateMonitor::UpdateMonitor(LedControlPtr leds, UpdatePaths paths, bool revoke_io, Milliseconds timeout)
+    : leds_(std::move(leds)), paths_(std::move(paths)), helper_(revoke_io, timeout),
+      watch_(inotify_init1(IN_NONBLOCK | IN_CLOEXEC)) {
+    if (!watch_) std::cerr << "Filesystem notifications unavailable; using periodic reconciliation\n";
+    watchDirectories(); rebootStatus(); display();
+}
+UpdateMonitor::~UpdateMonitor() {
+    try { leds_->SetSystemLed(LED_BLUE | LED_RED, false); } catch (...) {}
+}
+void UpdateMonitor::watchDirectories() {
+    if (!watch_) return;
+    const std::array<std::string, 3> paths{{paths_.runtime, paths_.dpkg, paths_.apt}};
+    for (size_t i = 0; i < paths.size(); ++i) if (watches_[i] < 0)
+        watches_[i] = inotify_add_watch(watch_.get(), paths[i].c_str(),
+            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
+}
+void UpdateMonitor::rebootStatus() {
+    struct stat st{};
+    const auto path = paths_.runtime + "/reboot-required";
+    if (stat(path.c_str(), &st) == 0) reboot_ = true;
+    else if (errno == ENOENT) reboot_ = false;
+    else std::cerr << "Cannot check reboot-required: " << strerror(errno) << '\n';
+}
+void UpdateMonitor::display() {
+    const int color = reboot_ ? LED_RED : known_ && counts_.security ? LED_BLUE | LED_RED :
+        known_ && counts_.total ? LED_BLUE : 0;
+    if (color == color_) return;
+    for (int channel : {LED_BLUE, LED_RED})
+        if (color_ < 0 || ((color ^ color_) & channel)) leds_->SetSystemLed(channel, (color & channel) != 0);
+    color_ = color;
+}
+void UpdateMonitor::filesystemEvents(Time now) {
+    if (!watch_) return;
+    bool reboot_changed = false, packages_changed = false;
+    for (unsigned batch = 0; batch < 4; ++batch) {
+        alignas(inotify_event) char buffer[4096];
+        const auto n = read(watch_.get(), buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && errno == EAGAIN) break;
+        if (n <= 0) { watch_.reset(); break; }
+        for (size_t pos = 0; pos < static_cast<size_t>(n);) {
+            const auto* event = reinterpret_cast<const inotify_event*>(buffer + pos);
+            const std::string name = event->len ? event->name : "";
+            if (event->mask & IN_Q_OVERFLOW) { reboot_changed = packages_changed = true; }
+            if (event->wd == watches_[0] && name == "reboot-required") reboot_changed = true;
+            if ((event->wd == watches_[1] && name == "status") || event->wd == watches_[2]) packages_changed = true;
+            if (event->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                for (auto& wd : watches_) if (wd == event->wd) {
+                    if (!(event->mask & IN_IGNORED)) inotify_rm_watch(watch_.get(), wd);
+                    wd = -1;
+                }
+                reboot_changed = packages_changed = true;
+            }
+            pos += sizeof(inotify_event) + event->len;
+        }
+    }
+    if (reboot_changed) { rebootStatus(); display(); }
+    // Leading-edge deadline bounds debounce even under a continuous event stream.
+    if (packages_changed && !pending_) { pending_ = true; debounce_ = now + std::chrono::seconds(2); }
+}
+void UpdateMonitor::service(Time now) {
+    const bool was_running = helper_.running();
+    helper_.service(now);
+    if (was_running && helper_.finished()) {
+        UpdateCounts result;
+        if (helper_.success() && parseUpdateCounts(helper_.output(), result)) {
+            counts_ = result; known_ = true; next_ = now + std::chrono::minutes(15);
+        } else {
+            std::cerr << "Update check failed; retaining last-known status and retrying in 60 seconds\n";
+            next_ = now + std::chrono::seconds(60); not_before_ = next_;
+        }
+        if (!stopping_) display();
+    }
+    if (stopping_) return;
+    if (now >= fallback_) {
+        watchDirectories(); rebootStatus(); display();
+        fallback_ = now + std::chrono::seconds(30);
+    }
+    if (!helper_.running() && now >= not_before_ && (now >= next_ || (pending_ && now >= debounce_))) {
+        try { helper_.start(paths_.command, now); pending_ = false; }
+        catch (const std::exception& error) {
+            std::cerr << "Update helper: " << error.what() << '\n';
+            next_ = now + std::chrono::seconds(60); not_before_ = next_; pending_ = false;
+        }
+    }
+}
+void UpdateMonitor::stop(Time now) {
+    stopping_ = true; helper_.stop(now);
+    if (color_ != 0) { leds_->SetSystemLed(LED_BLUE | LED_RED, false); color_ = 0; }
 }
 
-/**
- * Destructor.
- * Stop the thread cleanly if not already done.
- */
-UpdateMonitor::~UpdateMonitor()
-{
-	if(instance_started_)
-	{
-		Stop();
-	}
+int UpdateMonitor::waitMs(Time now) const {
+    if (helper_.running()) return 50;
+    if (stopping_) return 0;
+    const auto check = std::max(not_before_, pending_ ? std::min(next_, debounce_) : next_);
+    return millisecondsUntil(std::min(check, fallback_), now);
 }
-
-/**
- * Starts the update monitoring thread.
- * @public
- */
-void UpdateMonitor::Start()
-{
-	if (instance_started_)
-	{
-		if (verbose > 0)
-		{
-			std::cout << "Update monitor thread already running.\n";
-		}
-		return;
-	}
-	if (pthread_create(&monitor_thread_, NULL, MonitorThreadProc, NULL) != 0)
-	{
-		throw ErrnoException("pthread_create");
-	}
-	instance_started_ = true;
-	if (verbose > 0)
-	{
-		std::cout << "Update monitor thread started.\n";
-	}
-}
-
-/**
- * Stops the update monitoring thread.
- * @public
- */
-void UpdateMonitor::Stop()
-{
-	if (!instance_started_)
-	{
-		if (verbose > 0)
-		{
-			std::cout << "Update monitor thread already stopped.\n";
-		}
-		return;
-	}
-	if (verbose > 0)
-	{
-		std::cout << "Attempting to stop update monitor thread.\n";
-	}
-	//Cancelling thread.
-	if(pthread_cancel(monitor_thread_) != 0)
-	{
-		throw ErrnoException("pthread_cancel");
-	}
-	//Waiting for thread to join.
-	if(pthread_join(monitor_thread_, NULL) != 0)
-	{
-		throw ErrnoException("pthread_join");
-	}
-	if (verbose > 0)
-	{
-		std::cout << "Update monitor thread stopped.\n";
-	}
-}
-
-/***********************************************************
-* Private                                                  *
-***********************************************************/
-/**
- * Cleans up after the update monitoring thread.
- * @param arg Required by definition but not used.
- * @private @static
- */
-void UpdateMonitor::MonitorThreadCleanupHandler(void* /*arg*/)
-{
-	if (verbose > 0)
-	{
-		std::cout << "Cleaning up after the update monitor thread.\n";
-	}
-	instance_started_ = false;
-	//Reset LED.
-	leds_->SetSystemLed(LED_BLUE | LED_RED, false);
-}
-
-/**
- * The thread monitoring the update status and setting the system LED.
- * @param arg Required by definition but not used.
- * @private @static
- */
-void* UpdateMonitor::MonitorThreadProc(void* /*arg*/)
-{
-	pthread_cleanup_push(MonitorThreadCleanupHandler, NULL);
-	while(true)
-	{
-		if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL) != 0)
-		{
-			throw ErrnoException("pthread_setcancelstate");
-		}
-		int update_count = -1, security_update_count = -1;
-		if(!GetUpdateStatus(&update_count, &security_update_count))
-		{
-			break;
-		}
-		bool reboot_required = IsRebootRequired();
-		if (verbose > 1)
-		{
-			std::cout << "--- Update Monitor ---\n";
-			std::cout << "  Updates          : " << update_count << "\n"; 
-			std::cout << "  Security Updates : " << security_update_count << "\n";
-			std::cout << "  Reboot Required  : " << (reboot_required ? "YES" : "NO") << "\n";
-		}
-		if (reboot_required)
-		{
-			//Red
-			leds_->SetSystemLed(LED_RED, true);
-			leds_->SetSystemLed(LED_BLUE, false);
-		}
-		else if (security_update_count > 0)
-		{
-			//Purple
-			leds_->SetSystemLed(LED_BLUE | LED_RED, true);
-		}
-		else if (update_count > 0)
-		{
-			//Blue
-			leds_->SetSystemLed(LED_BLUE, true);
-			leds_->SetSystemLed(LED_RED, false);
-		}
-		else //Nothing
-		{
-			//Off
-			leds_->SetSystemLed(LED_BLUE | LED_RED, false);
-		}
-		if (pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL) != 0)
-		{
-			throw ErrnoException("pthread_setcancelstate");
-		}
-		sleep(900); //Sleep 15 minutes. //A cancellation point.
-	}
-	std::cout << "Update monitor thread stopped from within monitoring loop.\n";
-	pthread_cleanup_pop(1); //Remove handler and execute it.
-	return NULL;
-}
-
-/**
- * Checks for available system updates.
- * Uses update-notifier-common to check for updates via apt-check.
- * @param[out] update_count Returns number of avaiable updates.
- * @param[out] security_update_count Returns number of available security updates.
- * @return Returns true if information could be read.
- * @private @static
- */
-bool UpdateMonitor::GetUpdateStatus(int* update_count, int* security_update_count)
-{
-	//For some reason stderr has the result not stdout so we redirect it to stdout.
-	FILE* apt_check = popen("/usr/lib/update-notifier/apt-check 2>&1", "r");
-	if (apt_check == NULL)
-	{
-		if (verbose > 1)
-		{
-			std::cout << "apt-check does not exist or can't be read.\n";
-		}
-		return false;
-	}
-	char* line = NULL;
-	size_t len = 0;
-	int res = getline(&line, &len, apt_check);
-	pclose(apt_check);
-	if (res == -1 || len < 3)
-	{
-		if (verbose > 1)
-		{
-			std::cout << "Couldn't read line. res = " << res << "; len = " << len
-				<< "; line = \"" << line << "\"\n";
-		}
-		return false;
-	}
-	std::string str_line(line);
-	int pos_delim = str_line.find(";");
-	if (pos_delim > (int)str_line.length())
-	{
-		if (verbose > 1)
-		{
-			std::cout << "Couldn't find seperator ; in apt-check string: \""
-				<< line << "\"\n";
-		}
-		return false;
-	}
-	*update_count = atoi(str_line.substr(0, pos_delim).c_str());
-	*security_update_count = atoi(str_line.substr(pos_delim+1).c_str());
-	return true;
-}
-
-/**
- * Checks if reboot is required.
- * @return Returns true if reboot is required.
- * @private @static
- */
-bool UpdateMonitor::IsRebootRequired()
-{
-	std::ifstream reboot_required("/var/run/reboot-required");
-	return reboot_required.good(); //Returns whether file exists.
-}
-
-/**
- * LED control interface.
- * @private @static
- */
-LedControlPtr UpdateMonitor::leds_; //Assigned in constructor.
-
-/**
- * Helper variable keeping track of thread status.
- * @private @static
- */
-bool UpdateMonitor::instance_started_ = false;

@@ -35,36 +35,43 @@
  *    distribution.
  */
 
-#ifndef UPDATE_MONITOR_H_
-#define UPDATE_MONITOR_H_
-
-#include <pthread.h>
-
+// Altered version, 2026: asynchronous helper and independent reboot notifications.
+#pragma once
+#include "helper_process.h"
 #include "led_control_base.h"
-
-class UpdateMonitor
-{
-public:
-	explicit UpdateMonitor(const LedControlPtr& leds); //Prevent implicit conversions.
-	~UpdateMonitor();
-	void Start();
-	void Stop();
-private:
-	static void MonitorThreadCleanupHandler (void* /*arg*/);
-	static void* MonitorThreadProc (void* /*arg*/);
-	static bool GetUpdateStatus(int* update_count, int* security_update_count);
-	static bool IsRebootRequired();
-	
-	static LedControlPtr leds_;
-	static bool instance_started_;
-	pthread_t monitor_thread_;
-	
-	/**
-	 * DISALLOW_COPY_AND_ASSIGN 
-	 * @see http://google-styleguide.googlecode.com/svn/trunk/cppguide.xml#Copy_Constructors
-	 */
-	UpdateMonitor(const UpdateMonitor&);
-	void operator=(const UpdateMonitor&);
+#include <array>
+struct UpdateCounts { uint64_t total = 0, security = 0; };
+bool parseUpdateCounts(const std::string& output, UpdateCounts& counts);
+struct UpdatePaths {
+    std::vector<std::string> command{"/usr/lib/update-notifier/apt-check"};
+    std::string runtime = "/run";
+    std::string dpkg = "/var/lib/dpkg";
+    std::string apt = "/var/lib/apt/lists";
 };
-
-#endif //UPDATE_MONITOR_H_
+class UpdateMonitor {
+    LedControlPtr leds_;
+    UpdatePaths paths_;
+    HelperProcess helper_;
+    Fd watch_;
+    std::array<int, 3> watches_{{-1, -1, -1}};
+    UpdateCounts counts_;
+    bool known_ = false, reboot_ = false, stopping_ = false;
+    bool pending_ = false;
+    int color_ = -1;
+    Time next_{}, fallback_{}, debounce_{}, not_before_{};
+    void watchDirectories();
+    void rebootStatus();
+    void display();
+public:
+    explicit UpdateMonitor(LedControlPtr leds, UpdatePaths paths = {}, bool revoke_io = true,
+                           Milliseconds timeout = Milliseconds(30000));
+    ~UpdateMonitor();
+    int watchFd() const { return watch_.get(); }
+    int helperFd() const { return helper_.fd(); }
+    void filesystemEvents(Time now);
+    void service(Time now);
+    void stop(Time now);
+    bool running() const { return helper_.running(); }
+    bool known() const { return known_; }
+    int waitMs(Time now) const;
+};
