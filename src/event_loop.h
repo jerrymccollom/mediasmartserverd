@@ -2,6 +2,8 @@
 #pragma once
 #include "runtime.h"
 class UpdateMonitor;
+class IpcServer;
+struct DaemonState;
 class DeviceEvents {
 public:
     virtual ~DeviceEvents() = default;
@@ -14,4 +16,5 @@ public:
     virtual void clear() = 0;
     virtual int waitMs(Time now) const = 0;
 };
-void runEventLoop(Signals& signals, DeviceEvents& devices, UpdateMonitor* updates, bool activity);
+void runEventLoop(Signals& signals, DeviceEvents& devices, UpdateMonitor* updates, bool& activity,
+    IpcServer& ipc, DaemonState& state);

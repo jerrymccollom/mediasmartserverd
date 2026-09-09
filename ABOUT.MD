@@ -67,10 +67,13 @@ make
 ./mediasmartserverd --version
 ```
 
-`make -j2` builds incrementally and creates `./mediasmartserverd`; it does not
-install it or restart a running copy. There is no `make install` target. The
-Makefile requires a C++17 compiler and links libudev. Objects and generated header
-dependencies are kept in `build/`. The daemon has no update-monitor worker thread.
+`make -j2` builds incrementally and creates `./mediasmartserverd` and
+`./mediasmartctl`; it does not install them or restart a running copy. Run
+`sudo make install` to copy both binaries to `/usr/sbin` (or `sudo make install
+PREFIX=/path` to install elsewhere); it does not restart a running copy or
+install the systemd unit. The Makefile requires a C++17 compiler and links
+libudev. Objects and generated header dependencies are kept in `build/`. The
+daemon has no update-monitor worker thread.
 
 Run `make test` for hardware-free regression and process-integration tests, and
 `make test-sanitize` for AddressSanitizer/UndefinedBehaviorSanitizer checks. These
@@ -103,10 +106,10 @@ If upgrading or replacing an existing installation, stop its service or process
 first. Disable any competing startup entry (for example, an older Upstart job or
 an entry in `/etc/rc.local`) so only one instance starts at boot.
 
-Install the binary and bundled service, then enable monitoring now and at boot:
+Install the daemon and CLI, and the bundled service, then enable monitoring now and at boot:
 
 ```bash
-sudo install -m 0755 mediasmartserverd /usr/sbin/mediasmartserverd
+sudo make install
 sudo install -m 0644 lib/systemd/system/mediasmartserver.service /etc/systemd/system/mediasmartserver.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now mediasmartserver.service
@@ -154,10 +157,11 @@ After building, test normal monitoring in the foreground:
 sudo ./mediasmartserverd --activity --brightness=4 --verbose
 ```
 
-Stop it with Ctrl+C. To install the executable and launch it in the background:
+Stop it with Ctrl+C. To install the daemon and CLI and launch the daemon in the
+background:
 
 ```bash
-sudo install -m 0755 mediasmartserverd /usr/sbin/mediasmartserverd
+sudo make install
 sudo /usr/sbin/mediasmartserverd -D --activity --brightness=4
 ```
 

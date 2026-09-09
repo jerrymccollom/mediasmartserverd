@@ -4,11 +4,14 @@ CPPFLAGS ?= -Isrc
 CXXFLAGS ?= -O2 -g -std=c++17 -Wall -Wextra -Wpedantic
 LDLIBS = -ludev
 BUILD ?= build
-SOURCES = runtime device_monitor update_monitor helper_process event_loop hardware light_show
+SOURCES = runtime device_monitor update_monitor helper_process event_loop hardware light_show ipc_protocol ipc_server command_dispatch
 OBJECTS = $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
 
-.PHONY: all clean test test-sanitize prepare-for-packaging package-unsigned package-signed
-all: mediasmartserverd
+PREFIX ?= /usr
+SBINDIR ?= $(PREFIX)/sbin
+
+.PHONY: all clean install test test-sanitize prepare-for-packaging package-unsigned package-signed
+all: mediasmartserverd mediasmartctl
 
 $(BUILD):
 	mkdir -p $@
@@ -18,6 +21,13 @@ $(BUILD)/%.o: src/%.cpp | $(BUILD)
 
 mediasmartserverd: $(OBJECTS) $(BUILD)/mediasmartserverd.o
 	$(CXX) $(LDFLAGS) $^ $(LDLIBS) -o $@
+
+mediasmartctl: $(BUILD)/ipc_protocol.o $(BUILD)/runtime.o $(BUILD)/mediasmartctl.o
+	$(CXX) $(LDFLAGS) $^ -o $@
+
+install: mediasmartserverd mediasmartctl
+	install -d $(DESTDIR)$(SBINDIR)
+	install -m 0755 mediasmartserverd mediasmartctl $(DESTDIR)$(SBINDIR)/
 
 $(BUILD)/tests: tests/tests.cpp $(OBJECTS) | $(BUILD)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -MF $(BUILD)/tests.d $< $(OBJECTS) $(LDFLAGS) $(LDLIBS) -o $@
@@ -33,9 +43,9 @@ test-sanitize:
 
 clean:
 	$(RM) -r build
-	$(RM) *.o mediasmartserverd core
+	$(RM) *.o mediasmartserverd mediasmartctl core
 
--include $(OBJECTS:.o=.d) $(BUILD)/mediasmartserverd.d $(BUILD)/tests.d
+-include $(OBJECTS:.o=.d) $(BUILD)/mediasmartserverd.d $(BUILD)/mediasmartctl.d $(BUILD)/tests.d
 
 prepare-for-packaging:
 	@if [ "$(PACKAGE_VERSION)" != "" ]; then \

@@ -20,6 +20,8 @@ set -e
 
 case "$1" in
     configure)
+        addgroup --system mediasmart >/dev/null 2>&1 || true
+
         INIT=$(ps --pid 1 | grep -q systemd && echo 'systemd' || echo 'upstart')
         case "$INIT" in
             systemd)

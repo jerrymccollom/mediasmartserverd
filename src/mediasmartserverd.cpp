@@ -47,6 +47,8 @@
 #include "device_monitor.h"
 #include "hardware.h"
 #include "event_loop.h"
+#include "daemon_state.h"
+#include "ipc_server.h"
 #include "light_show.h"
 #include "runtime.h"
 #include <poll.h>
@@ -220,6 +222,9 @@ int main( int argc, char* argv[] ) try {
     } cleanup{leds};
     if (signals.consume()) return 0;
     if (disable_watchdog) leds->DisableWatchdog();
+    // Bind the control socket while still root so it can be owned by the "mediasmart" group.
+    IpcServer ipc("/run/mediasmartserverd.sock", "mediasmart");
+    DaemonState state{leds, activity, brightness, disable_watchdog};
     Privileges privileges;
     dropPrivileges(privileges, runtime_user);
     if (signals.consume()) return 0;
@@ -231,9 +236,10 @@ int main( int argc, char* argv[] ) try {
     if (xmas) { cleanup.enabled = false; return 0; }
     if (light_show) return run_light_show(leds, light_show, signals);
     DeviceMonitor devices(leds);
+    state.devices = &devices;
     std::unique_ptr<UpdateMonitor> updates;
     if (run_update_monitor && !signals.consume()) updates = std::make_unique<UpdateMonitor>(leds);
-    runEventLoop(signals, devices, updates.get(), activity);
+    runEventLoop(signals, devices, updates.get(), activity, ipc, state);
 
 	return 0;
 
