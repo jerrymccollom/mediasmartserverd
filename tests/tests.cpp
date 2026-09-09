@@ -7,6 +7,10 @@
 #include "led_hpex485.h"
 #include "led_acerh341.h"
 #include "update_monitor.h"
+#include "ipc_protocol.h"
+#include "ipc_server.h"
+#include "command_dispatch.h"
+#include "daemon_state.h"
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -21,6 +25,8 @@
 #include <stdexcept>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <fcntl.h>
 
 int debug = 0, verbose = 0;
@@ -37,10 +43,13 @@ struct FakeLeds : LedControlBase {
     std::array<int, 4> bays{};
     int system = 0;
     size_t calls = 0;
+    bool watchdog_disabled = false;
+    int brightness = -1;
     const char* Desc() const override { return "fake"; }
     bool Init() override { return true; }
     void MountUsb(bool) override {}
-    void SetBrightness(int) override {}
+    void SetBrightness(int val) override { brightness = val; }
+    void DisableWatchdog() override { watchdog_disabled = true; }
     void Set(int channel, size_t bay, bool on) override {
         CHECK(bay < 4); ++calls;
         if (on) bays[bay] |= channel; else bays[bay] &= ~channel;
@@ -423,7 +432,9 @@ struct EventDevices : DeviceEvents {
 void testEventLoop(const std::string& fixture) {
     Signals signals; EventDevices devices; TempDir dir; auto leds = std::make_shared<FakeLeds>();
     UpdatePaths paths{{fixture, "ignore"}, dir.path, dir.path, dir.path}; UpdateMonitor updates(leds, paths, false);
-    const auto start = Clock::now(); runEventLoop(signals, devices, &updates, true);
+    IpcServer ipc(dir.path + "/ipc.sock", "nonexistent-test-group");
+    bool activity_flag = true; DaemonState state{leds, activity_flag};
+    const auto start = Clock::now(); runEventLoop(signals, devices, &updates, activity_flag, ipc, state);
     const auto elapsed = std::chrono::duration_cast<Milliseconds>(Clock::now() - start).count();
     CHECK(elapsed < 2000); CHECK(devices.events == 100); CHECK(devices.samples >= 3); CHECK(devices.cleared && !updates.running());
     std::sort(devices.latency.begin(), devices.latency.end());
@@ -444,13 +455,170 @@ void testIdleAndProcessingSignals() {
         int waitMs(Time now) const override { return millisecondsUntil(stop_at, now); }
     };
     for (int scenario = 0; scenario < 3; ++scenario) {
-        Signals signals; IdleDevices devices;
+        Signals signals; IdleDevices devices; TempDir dir; auto leds = std::make_shared<FakeLeds>();
+        IpcServer ipc(dir.path + "/ipc.sock", "nonexistent-test-group");
+        bool activity_flag = scenario != 1; DaemonState state{leds, activity_flag};
         devices.disks = scenario ? 4 : 0; devices.stop_in_sample = scenario == 2;
-        const auto start = Clock::now(); runEventLoop(signals, devices, nullptr, scenario != 1);
+        const auto start = Clock::now(); runEventLoop(signals, devices, nullptr, activity_flag, ipc, state);
         CHECK(devices.cleared);
         CHECK(devices.samples == (scenario == 2 ? 1U : 0U));
         CHECK(Clock::now() - start < Milliseconds(500));
     }
+}
+void testIpcProtocol() {
+    Command cmd; std::string error;
+    CHECK(parseCommandLine("brightness 5", cmd, error));
+    CHECK(cmd.type == CommandType::Brightness && cmd.intValue == 5);
+    CHECK(formatCommand(cmd) == "BRIGHTNESS 5");
+    CHECK(!parseCommandLine("brightness 10", cmd, error));
+    CHECK(!parseCommandLine("brightness", cmd, error));
+    CHECK(!parseCommandLine("brightness 3 extra", cmd, error));
+
+    CHECK(parseCommandLine("light-show 13", cmd, error));
+    CHECK(cmd.type == CommandType::LightShow && cmd.intValue == 13);
+    CHECK(!parseCommandLine("light-show 14", cmd, error));
+    CHECK(!parseCommandLine("light-show 0", cmd, error));
+    CHECK(parseCommandLine("light-show stop", cmd, error));
+    CHECK(cmd.type == CommandType::LightShowStop);
+    CHECK(formatCommand(cmd) == "LIGHT-SHOW STOP");
+
+    CHECK(parseCommandLine("activity on", cmd, error));
+    CHECK(cmd.type == CommandType::Activity && cmd.boolValue == true);
+    CHECK(formatCommand(cmd) == "ACTIVITY ON");
+    CHECK(parseCommandLine("activity off", cmd, error));
+    CHECK(cmd.boolValue == false);
+    CHECK(!parseCommandLine("activity sideways", cmd, error));
+
+    CHECK(parseCommandLine("disable-watchdog", cmd, error));
+    CHECK(cmd.type == CommandType::DisableWatchdog);
+    CHECK(parseCommandLine("status", cmd, error));
+    CHECK(cmd.type == CommandType::Status);
+    CHECK(!parseCommandLine("", cmd, error));
+    CHECK(!parseCommandLine("unknown-command", cmd, error));
+
+    Response response{true, "brightness set to 5"};
+    CHECK(formatResponse(response) == "OK brightness set to 5");
+    Response parsed;
+    parseResponseLine("OK brightness set to 5", parsed);
+    CHECK(parsed.ok && parsed.text == "brightness set to 5");
+    parseResponseLine("ERROR bad value", parsed);
+    CHECK(!parsed.ok && parsed.text == "bad value");
+}
+void testDispatch() {
+    auto leds = std::make_shared<FakeLeds>();
+    Signals signals; bool activity_flag = false; DaemonState state{leds, activity_flag};
+
+    auto response = dispatch(Command{CommandType::Brightness, 7, false}, state, signals, nullptr);
+    CHECK(response.ok && state.last_brightness == 7);
+
+    response = dispatch(Command{CommandType::Activity, 0, true}, state, signals, nullptr);
+    CHECK(response.ok && activity_flag == true);
+
+    response = dispatch(Command{CommandType::DisableWatchdog, 0, false}, state, signals, nullptr);
+    CHECK(response.ok && state.watchdog_disabled);
+
+    response = dispatch(Command{CommandType::LightShowStop, 0, false}, state, signals, nullptr);
+    CHECK(!response.ok);
+
+    response = dispatch(Command{CommandType::Status, 0, false}, state, signals, nullptr);
+    CHECK(response.ok && response.text.find("activity=on") != std::string::npos);
+    CHECK(response.text.find("brightness=7") != std::string::npos);
+    CHECK(response.text.find("watchdog_disabled=yes") != std::string::npos);
+}
+void testIpcServerRoundTrip() {
+    TempDir dir; const auto path = dir.path + "/ipc.sock";
+    IpcServer server(path, "nonexistent-test-group");
+
+    const int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(client >= 0);
+    sockaddr_un addr{}; addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    CHECK(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string request = "STATUS\n";
+    CHECK(send(client, request.data(), request.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(request.size()));
+
+    pollfd waiter{server.fd(), POLLIN, 0};
+    CHECK(poll(&waiter, 1, 2000) == 1);
+    server.acceptAndHandle([](const Command& cmd, const ResponseCallback&) -> Response {
+        CHECK(cmd.type == CommandType::Status);
+        return {true, "hardware=fake"};
+    });
+
+    char buffer[256] = {};
+    const auto n = recv(client, buffer, sizeof(buffer) - 1, 0);
+    CHECK(n > 0);
+    CHECK(std::string(buffer, n) == "OK hardware=fake\n");
+    close(client);
+
+    // Oversized line is rejected instead of growing memory unbounded.
+    const int client2 = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(client2 >= 0);
+    CHECK(connect(client2, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string oversized(kMaxCommandLine + 10, 'x');
+    CHECK(send(client2, oversized.data(), oversized.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(oversized.size()));
+    shutdown(client2, SHUT_WR);
+    CHECK(poll(&waiter, 1, 2000) == 1);
+    server.acceptAndHandle([](const Command&, const ResponseCallback&) -> Response { CHECK(false); return {}; });
+    const auto n2 = recv(client2, buffer, sizeof(buffer) - 1, 0);
+    CHECK(n2 > 0);
+    CHECK(std::string(buffer, n2).rfind("ERROR", 0) == 0);
+    close(client2);
+}
+void testLightShowStopRestoresState() {
+    auto leds = std::make_shared<FakeLeds>();
+    auto source = std::make_unique<ReplaySource>();
+    source->snapshot = {disk(1)}; // Disk in bay 1, not bay 0: the show's first frame
+    DeviceMonitor monitor(leds, std::move(source));               // lights bay 0 and leaves bay 1 dark.
+    CHECK(leds->bays[1] == LED_BLUE); // baseline reflecting the actual disk
+
+    Signals signals; bool activity_flag = false;
+    DaemonState state{leds, activity_flag, 5, false, &monitor};
+    TempDir dir; const auto path = dir.path + "/ipc.sock";
+    IpcServer ipc(path, "nonexistent-test-group");
+
+    const int client = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(client >= 0);
+    sockaddr_un addr{}; addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    CHECK(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string request = "LIGHT-SHOW STOP\n";
+    CHECK(send(client, request.data(), request.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(request.size()));
+
+    // The show mutates bays/brightness for one frame, then the pre-queued STOP
+    // is processed on the very first poll iteration.
+    CHECK(run_light_show(leds, 3, signals, &ipc, &state) == 0);
+
+    char buffer[256] = {};
+    const auto n = recv(client, buffer, sizeof(buffer) - 1, 0);
+    CHECK(n > 0);
+    CHECK(std::string(buffer, n) == "OK light show stopped\n");
+    close(client);
+
+    // The show's first frame directly lit bay 0 (no disk there) and dark-ened bay 1
+    // (which has a disk); the registry's cache never saw those writes, so a plain
+    // reconcile() alone would leave both wrong. resync() must force both back.
+    CHECK(leds->bays[0] == 0);        // bay without a disk goes dark again, not left lit
+    CHECK(leds->bays[1] == LED_BLUE); // bay with a disk goes back to blue, not left dark
+    CHECK(leds->brightness == 5); // restored to the last explicitly configured brightness
+}
+void testLightShowStartAcknowledgesImmediately() {
+    // Starting a show must not leave the requesting client waiting for it to stop:
+    // dispatch() should invoke the early-reply callback before run_light_show() blocks.
+    auto leds = std::make_shared<FakeLeds>();
+    Signals signals; bool activity_flag = false;
+    DaemonState state{leds, activity_flag};
+    bool acknowledged = false;
+    Response early;
+    // A show with no ipc/state only stops via signals, so pre-raise SIGTERM: this
+    // proves the acknowledgment fires synchronously before run_light_show() blocks,
+    // regardless of how quickly (or slowly) the show itself subsequently returns.
+    CHECK(kill(getpid(), SIGTERM) == 0);
+    const auto response = dispatch(Command{CommandType::LightShow, 3, false}, state, signals, nullptr,
+        [&](const Response& r) { acknowledged = true; early = r; });
+    CHECK(acknowledged);
+    CHECK(early.ok && early.text == "light show started");
+    CHECK(response.text == "light show finished");
+    (void)response;
 }
 void testShowSignals() {
     struct InterruptLeds : FakeLeds {
@@ -486,6 +654,11 @@ int main(int argc, char** argv) {
         {"update failure recovery and watch replacement", [&] { testUpdateRecovery(fixture); }},
         {"idle polling and signals during processing", testIdleAndProcessingSignals},
         {"termination during all 13 light shows", testShowSignals},
+        {"ipc protocol parsing", testIpcProtocol},
+        {"command dispatch", testDispatch},
+        {"ipc server round trip", testIpcServerRoundTrip},
+        {"light show stop restores state", testLightShowStopRestoresState},
+        {"light show start acknowledges immediately", testLightShowStartAcknowledgesImmediately},
         {"event-loop responsiveness", [&] { testEventLoop(fixture); }}
     };
     for (const auto& test : tests) {

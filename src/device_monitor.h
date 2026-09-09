@@ -72,6 +72,7 @@ public:
     bool add(const Disk& disk);
     void remove(std::string path, uint64_t sequence = 0);
     void reconcile(const std::vector<Disk>& disks);
+    void resync();
     void sample(Time now);
     size_t count() const;
     void clear();
@@ -114,6 +115,7 @@ public:
     int fd() const override { return connected_ ? source_->fd() : -1; }
     void drain(Time now) override;
     void reconcile();
+    void resync() { registry_.resync(); }
     void maintain(Time now) override;
     void disconnected(Time now) override { connected_ = false; reconcile_at_ = now; }
     void sample(Time now) override { registry_.sample(now); }

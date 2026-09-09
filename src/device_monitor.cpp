@@ -127,6 +127,16 @@ void DiskRegistry::reconcile(const std::vector<Disk>& disks) {
         if (desired[i]) add(*desired[i]);
     }
 }
+void DiskRegistry::resync() {
+    // Something outside the registry (a light show) may have driven these LEDs
+    // directly, so `color()`'s cached-value skip would otherwise leave stale hardware
+    // state in place. Force every bay to be rewritten regardless of the cache; any
+    // busy/red indication is restored separately by the next sample().
+    for (size_t i = 0; i < bays_.size(); ++i) {
+        bays_[i].color = -1;
+        color(i, bays_[i].disk.path.empty() ? 0 : LED_BLUE);
+    }
+}
 void DiskRegistry::sample(Time now) {
     for (size_t i = 0; i < bays_.size(); ++i) {
         auto& bay = bays_[i];
